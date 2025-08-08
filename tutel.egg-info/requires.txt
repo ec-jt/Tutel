@@ -1,0 +1,6 @@
+numpy
+
+[test]
+GPUtil>=1.4.0
+pytest-subtests>=0.4.0
+pytest>=6.2.2

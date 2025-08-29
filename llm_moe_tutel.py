@@ -101,10 +101,18 @@ for path in args.try_path:
     break
 
 if model_id is None:
-    model_id = 'nvidia/DeepSeek-R1-FP4' if len(args.try_path) == 0 else args.try_path[0]
-    raise Exception(f"DeepSeek R1/V3/R1-FP4 model data is not found in {model_id}, please download it first:\n\n  >> huggingface-cli download {model_id} --local-dir '{model_id}'\n")
+  model_id = 'nvidia/DeepSeek-R1-FP4' if len(args.try_path) == 0 else args.try_path[0]
+
+  def trim_model_path(path):
+    while path.endswith('/'):
+      path = path[:-1]
+    while path.startswith('/') or path.startswith('./') or path.startswith('../'):
+      path = path[path.index('/') + 1:]
+    return path
+
+  raise Exception(f"DeepSeek R1/V3/R1-FP4 model data is not found in {model_id}, please download it first:\n\n  >> huggingface-cli download {trim_model_path(model_id)} --local-dir '{model_id}'\n")
 else:
-    master_print(f"[INFO] Discover the model from local path: {model_id}, chosen as the default model.")
+  master_print(f"[INFO] Discover the model from local path: {model_id}, chosen as the default model.")
 
 tokenizer = AutoTokenizer.from_pretrained(f'{model_id}', trust_remote_code=True)
 config = json.loads(pathlib.Path(f'{model_id}/config.json').read_text())
@@ -162,6 +170,17 @@ for f in os.listdir(model_id):
   if f.endswith('.safetensors'):
     load_to(f'{model_id}/{f}', state_dict)
 
+def pad_at_dim(x, dim, new_size):
+  padded_shape = list(x.shape)
+  if padded_shape[dim] == new_size:
+    return x
+  padded_shape[dim] = new_size
+  y = torch.empty(padded_shape, dtype=x.dtype, device=x.device)
+  y.narrow(dim, 0, x.size(dim)).copy_(x)
+  y.narrow(dim, x.size(dim), new_size - x.size(dim)).zero_()
+  return y
+
+
 def flood(w, device=None):
   if w is None:
     return w
@@ -189,7 +208,7 @@ def load_tensor_fp8(key, device='cuda', fp8_to_bf16=False):
 def world_slice(t, dim=0):
   if t is None:
     return t
-  assert t.size(dim) % world_size == 0, f'Failed during slicing shape {list(t.shape)} on dimension {dim}.'
+  assert t.size(dim) % world_size == 0, f'Failed during slicing tensor of shape {list(t.shape)} to {world_size} pieces at dim-{dim}.'
   group_size = t.size(dim) // world_size
   out = t.narrow(dim, world_rank * group_size, group_size).contiguous()
   if hasattr(t, 'scale_inv'):
@@ -280,14 +299,23 @@ elif model_type in ('qwen3_moe', 'qwen3'):
   master_print('>>>', k, state_dict[k].shape, state_dict[k].dtype, state_dict[k].view(-1)[:5]); exit(0)
 
 elif model_type in ('gpt_oss'):
- assert world_size <= 1, "Distributed mode is to be enabled in future versions. Please set `-e LOCAL_SIZE=1` instead."
-
  for k in state_dict:
   if k.startswith('model.layers.'):
     if int(k.split('.')[2]) >= n_layers:
       continue
-  if 'lm_head.weight' in k or 'model.embed_tokens.weight' in k or '.router.' in k or 'norm' in k or '.sinks' in k:
+  if 'model.embed_tokens.weight' in k or '.router.' in k or 'norm' in k:
     param[k] = state_dict[k].contiguous().to(torch.bfloat16).to(device)
+    continue
+  if 'lm_head.weight' in k:
+    param[k] = state_dict[k].contiguous().to(torch.bfloat16).to(device)
+    ''' original_size = param[k].size(1)
+    param[k] = pad_at_dim(param[k], 1, (param[k].size(1) + 127) // 128 * 128)
+    param[k], scale_inv = ops.to_float8_block(param[k])
+    param[k] = param[k].narrow(1, 0, original_size).contiguous()
+    param[k].scale_inv = scale_inv '''
+    continue
+  if '.sinks' in k:
+    param[k] = world_slice(state_dict[k].contiguous().to(torch.bfloat16).to(device))
     continue
   if 'attn.k_' in k or 'attn.v_' in k or '.bias' in k or '.experts.down_' in k or '.experts.gate_up_' in k:
     continue
@@ -319,15 +347,6 @@ def load_expert_weight(prefs, dim=None, dev='cpu'):
   if type(prefs) not in (tuple, list):
     prefs = [prefs]
   ws, ss, mi, mw = [], [], [], []
-
-  def pad_at_dim(x, dim, new_size):
-    padded_shape = list(x.shape)
-    padded_shape[dim] = new_size
-    y = torch.empty(padded_shape, dtype=x.dtype, device=x.device)
-    y.narrow(dim, 0, x.size(dim)).copy_(x)
-    y.narrow(dim, x.size(dim), new_size - x.size(dim)).zero_()
-    return y
-
   use_fp4 = (not args.disable_fp4) and (not args.hybrid_cpu)
 
   for pref in prefs:
@@ -423,12 +442,14 @@ def load_experts():
 
     local_device = device if not args.hybrid_cpu else 'cpu'
     if f'model.layers.{i}.mlp.experts.gate_up_proj_blocks' in state_dict:
-      def load_mxfp4(prefix, bias_scale):
-        p = state_dict[f'{prefix}_blocks'].to(local_device)
-        p.scales, p.bias = state_dict[f'{prefix}_scales'].to(local_device), state_dict[f'{prefix}_bias'].to(local_device) * bias_scale
+      def load_mxfp4(prefix, fn):
+        p = fn(state_dict[f'{prefix}_blocks']).to(local_device)
+        p.scales, p.bias = fn(state_dict[f'{prefix}_scales']).to(local_device), fn(state_dict[f'{prefix}_bias']).to(local_device)
         return p
-      gate_up_p += [load_mxfp4(f'model.layers.{i}.mlp.experts.gate_up_proj', 1.0)]
-      down_p += [load_mxfp4(f'model.layers.{i}.mlp.experts.down_proj', 1.0 / world_size)]
+
+      group_size = (90 + world_size - 1) // world_size * world_size
+      gate_up_p += [load_mxfp4(f'model.layers.{i}.mlp.experts.gate_up_proj', lambda x: world_slice(pad_at_dim(x, 1, group_size << 6), dim=1))]
+      down_p += [load_mxfp4(f'model.layers.{i}.mlp.experts.down_proj', lambda x: world_slice(pad_at_dim(x, 2, group_size), dim=2) if x.dim() >= 3 else x / world_size)]
     else:
       gate_up_proj = [load_expert_weight([f'model.layers.{i}.mlp.experts.{ID}.gate_proj', f'model.layers.{i}.mlp.experts.{ID}.up_proj'], dim=-2) for ID in range(n_experts)]
       down_proj = [load_expert_weight(f'model.layers.{i}.mlp.experts.{ID}.down_proj', dim=-1) for ID in range(n_experts)]
@@ -625,6 +646,7 @@ def token_encode(user_prompt, system_prompt=None):
       [{"role": "user", "content": user_prompt}] + ([] if system_prompt is None else [{"role": "system", "content": system_prompt}]),
       tokenize=False,
       add_generation_prompt=True,
+      reasoning_effort='low',
       enable_thinking=not args.disable_thinking
   )
   return tokenizer([text], return_tensors="pt")['input_ids'].view(-1) 
